@@ -8,62 +8,115 @@ BROADCAST_IP = '255.255.255.255'
 
 NODE_ID = str(uuid.uuid4())
 KNOWN_PEERS = {}
-ACTIVE_CONNECTIONS = {} # Stores TCP writer objects for active tunnels
+ACTIVE_CONNECTIONS = {} 
+
+# PHASE 3: Loop Prevention Cache
+SEEN_MESSAGES = set()
 
 # ---------------------------------------------------------
-# TCP SERVER & CLIENT LOGIC (PHASE 2)
+# ROUTING & MESH LOGIC (PHASE 3)
+# ---------------------------------------------------------
+
+async def flood_message(msg_dict, exclude_writer=None):
+    """Sends a message to all active TCP connections."""
+    # We append a newline '\n' to frame the JSON packets over the TCP stream
+    payload = (json.dumps(msg_dict) + "\n").encode()
+    
+    # Iterate through a copy of the dictionary items
+    for peer_id, writer in list(ACTIVE_CONNECTIONS.items()):
+        if writer != exclude_writer:
+            try:
+                writer.write(payload)
+                await writer.drain()
+            except Exception as e:
+                print(f"[-] Failed to route to {peer_id[:8]}: {e}")
+
+async def originate_message(target_id, content):
+    """Creates a brand new message and injects it into the mesh."""
+    msg_id = str(uuid.uuid4())
+    SEEN_MESSAGES.add(msg_id) # Prevent echoing our own message back to ourselves
+    
+    msg_dict = {
+        "msg_id": msg_id,
+        "sender_id": NODE_ID,
+        "target_id": target_id,
+        "content": content
+    }
+    
+    await flood_message(msg_dict)
+
+# ---------------------------------------------------------
+# TCP SERVER & CLIENT LOGIC
 # ---------------------------------------------------------
 
 async def handle_tcp_connection(reader, writer):
-    """Fired whenever a new TCP connection is established (incoming or outgoing)."""
     addr = writer.get_extra_info('peername')
     
     try:
         while True:
-            # Wait for data over the TCP tunnel
-            data = await reader.read(1024)
+            # Use readline() to ensure we get a complete JSON string 
+            data = await reader.readline()
             if not data:
-                break # Connection closed by peer
+                break 
             
-            print(f"\n[TCP MESSAGE from {addr[0]}]: {data.decode()}")
+            try:
+                msg_dict = json.loads(data.decode().strip())
+            except json.JSONDecodeError:
+                continue # Ignore corrupted data
+                
+            msg_id = msg_dict.get("msg_id")
+            
+            # 1. DEDUPLICATION (Loop Prevention)
+            if msg_id in SEEN_MESSAGES:
+                continue # We already routed this packet, drop it!
+                
+            SEEN_MESSAGES.add(msg_id)
+            
+            target_id = msg_dict.get("target_id")
+            sender_id = msg_dict.get("sender_id")
+            content = msg_dict.get("content")
+
+            # 2. IS IT FOR ME?
+            if target_id == NODE_ID or target_id == "ALL":
+                print(f"\n[INBOX - {sender_id[:8]}]: {content}")
+            
+            # 3. ROUTING (Relay it to others)
+            if target_id != NODE_ID:
+                print(f"\n[*] Relaying packet {msg_id[:4]}... to the mesh")
+                # Forward to everyone EXCEPT the node that just sent it to us
+                await flood_message(msg_dict, exclude_writer=writer)
             
     except ConnectionResetError:
-        pass # Peer disconnected
+        pass
     finally:
-        print(f"\n[-] TCP Connection lost: {addr}")
         writer.close()
         await writer.wait_closed()
-        # Note: In a production app, we would remove them from ACTIVE_CONNECTIONS here
 
 async def connect_to_peer(ip, port, peer_id):
-    """Acts as a client to open a TCP tunnel to a newly discovered peer."""
     if peer_id in ACTIVE_CONNECTIONS:
-        return # We already have a tunnel to this peer
+        return 
 
     try:
-        # Open the TCP connection
         reader, writer = await asyncio.open_connection(ip, port)
         ACTIVE_CONNECTIONS[peer_id] = writer
-        print(f"\n[+] TCP Tunnel Established with {peer_id[:8]} at {ip}:{port}")
-        
-        # Send a test message through the new tunnel
-        test_msg = f"Hello from Node {NODE_ID[:8]}!"
-        writer.write(test_msg.encode())
-        await writer.drain() # Ensure the data is pushed out of the buffer
+        print(f"\n[+] Connected to {peer_id[:8]}")
         
         # Start listening for messages coming back through this tunnel
         asyncio.create_task(handle_tcp_connection(reader, writer))
         
+        # Inject a broadcast test message to the mesh
+        await originate_message("ALL", "Hello Mesh Network!")
+        
     except Exception as e:
-        print(f"\n[-] Failed to establish TCP with {peer_id[:8]}: {e}")
+        pass
 
 # ---------------------------------------------------------
-# UDP DISCOVERY LOGIC (PHASE 1 UPDATED)
+# UDP DISCOVERY LOGIC 
 # ---------------------------------------------------------
 
 class PeerDiscoveryProtocol(asyncio.DatagramProtocol):
     def __init__(self, loop):
-        self.loop = loop # We need the event loop to schedule TCP connections
+        self.loop = loop
 
     def connection_made(self, transport):
         self.transport = transport
@@ -76,10 +129,7 @@ class PeerDiscoveryProtocol(asyncio.DatagramProtocol):
             ip = addr[0]
 
             if peer_id != NODE_ID and peer_id not in KNOWN_PEERS:
-                print(f"\n[*] UDP Radar found peer: {ip}:{tcp_port} (ID: {peer_id[:8]})")
                 KNOWN_PEERS[peer_id] = {"ip": ip, "tcp_port": tcp_port}
-                
-                # Phase 2 Trigger: Instantly attempt a TCP connection
                 self.loop.create_task(connect_to_peer(ip, tcp_port, peer_id))
                 
         except json.JSONDecodeError:
@@ -98,15 +148,12 @@ async def broadcast_presence(transport, tcp_port):
 async def main():
     loop = asyncio.get_running_loop()
     
-    # 1. Start the TCP Server (To accept incoming tunnels)
-    # We use port 0 to let the OS assign a random available port automatically
     tcp_server = await asyncio.start_server(handle_tcp_connection, '0.0.0.0', 0)
     my_tcp_port = tcp_server.sockets[0].getsockname()[1]
     
     print(f"[*] Node ID: {NODE_ID[:8]}")
     print(f"[*] TCP Server listening on port {my_tcp_port}")
 
-    # 2. Start the UDP Radar
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -119,7 +166,6 @@ async def main():
 
     asyncio.create_task(broadcast_presence(transport, my_tcp_port))
 
-    # Keep alive
     try:
         async with tcp_server:
             await tcp_server.serve_forever()
